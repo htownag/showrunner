@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://framework.local/measurement/ledger.schema.json",
+  "title": "Review Ledger Row",
+  "description": "One row of the review ledger (review-ledger-spec.md §1). A ledger file (JSONL) holds two kinds of row, distinguished by the `row_kind` discriminator: a DECISION row written once at gate-decision time (never mutated), and an AMENDMENT row appended later by the back-fill ritual to carry the knowable-later outcome_* group, keyed to a decision row via `outcome_ref_ledger_id`. Append-only integrity is preserved by never editing a decision row; outcomes arrive as separate amendment rows that the metrics reader folds onto their base row at read time (spec §1.3, §2). Modeling choice: `row_kind` is an explicit discriminator added on top of the spec's `outcome_kind=\"outcome\"` marker so a validator can branch cleanly — see boot-integration.md Spec-change notes.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/decisionRow" },
+    { "$ref": "#/$defs/amendmentRow" }
+  ],
+  "$defs": {
+    "ladder": {
+      "type": "string",
+      "enum": ["L0", "L1", "L2", "L3", "L4"],
+      "description": "Definition-of-Done ladder level (done-ladder.md / spec §1.1)."
+    },
+    "stage": {
+      "type": "string",
+      "enum": ["subagent-self", "lead-review", "design-advisor", "code-advisor", "automated-gate", "merge", "human-final"]
+    },
+    "findingsBySeverity": {
+      "type": "object",
+      "description": "Counts of findings by severity band. All four bands required so absence reads as an explicit zero, not an unknown.",
+      "properties": {
+        "blocker": { "type": "integer", "minimum": 0 },
+        "major": { "type": "integer", "minimum": 0 },
+        "minor": { "type": "integer", "minimum": 0 },
+        "nit": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["blocker", "major", "minor", "nit"],
+      "additionalProperties": false
+    },
+    "decisionRow": {
+      "type": "object",
+      "description": "A single verdict rendered by one reviewing actor at one pipeline stage on one unit in one rework round. Write-once.",
+      "properties": {
+        "row_kind": { "type": "string", "const": "decision" },
+        "ledger_id": { "type": "string", "description": "Stable unique id, e.g. RL-<seq> or a uuid." },
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "unit_id": { "type": "string", "description": "PR number / branch / task id." },
+        "unit_kind": { "type": "string", "enum": ["code", "spec", "asset", "doc", "pack", "config"] },
+        "lane": { "type": "string", "description": "Project's lane/team label as a neutral role, not a codename." },
+        "stage": { "$ref": "#/$defs/stage" },
+        "round": { "type": "integer", "minimum": 0, "description": "0 = first pass, 1+ = rework round." },
+        "reviewer_role": { "type": "string", "description": "Neutral role label (lead, advisor, director, submitting subagent role)." },
+        "reviewer_model": { "type": ["string", "null"], "description": "Model/tier label; null for deterministic gates." },
+        "reviewer_effort": { "type": "string", "enum": ["low", "medium", "high", "max", "deterministic"] },
+        "timestamp": { "type": "string", "description": "ISO-8601 UTC, at decision." },
+        "verdict": { "type": "string", "enum": ["pass", "pass-with-required-changes", "fail", "hold"] },
+        "verdict_reason": { "type": ["string", "null"], "description": "Short coded/free reason." },
+        "findings_count": { "type": "integer", "minimum": 0 },
+        "findings_by_severity": { "$ref": "#/$defs/findingsBySeverity" },
+        "finding_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Stable per-finding ids for later cross-reference."
+        },
+        "evidence_claimed": { "$ref": "#/$defs/ladder" },
+        "evidence_verified": {
+          "oneOf": [ { "$ref": "#/$defs/ladder" }, { "type": "null" } ],
+          "description": "Null if this stage did not independently re-verify."
+        },
+        "cost_tokens_in": { "type": ["integer", "null"], "minimum": 0 },
+        "cost_tokens_out": { "type": ["integer", "null"], "minimum": 0 },
+        "cost_usd": { "type": ["number", "null"], "minimum": 0 },
+        "wall_clock_seconds": { "type": ["number", "null"], "minimum": 0, "description": "Active review duration for this stage." }
+      },
+      "required": [
+        "row_kind", "ledger_id", "schema_version", "unit_id", "unit_kind", "lane",
+        "stage", "round", "reviewer_role", "reviewer_effort", "timestamp",
+        "verdict", "findings_count", "findings_by_severity", "evidence_claimed"
+      ],
+      "additionalProperties": false
+    },
+    "amendmentRow": {
+      "type": "object",
+      "description": "A knowable-later outcome record, appended by the back-fill ritual / horizon sweep, keyed to a decision row's ledger_id. Never mutates the decision row (spec §1.3, §2).",
+      "properties": {
+        "row_kind": { "type": "string", "const": "amendment" },
+        "ledger_id": { "type": "string", "description": "This amendment row's own stable id." },
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "outcome_kind": { "type": "string", "const": "outcome", "description": "Marks an amendment row (spec §1.1)." },
+        "outcome_ref_ledger_id": { "type": "string", "description": "The decision-row ledger_id this outcome amends." },
+        "merged": { "type": ["boolean", "null"], "description": "Did the unit merge." },
+        "merge_timestamp": { "type": ["string", "null"], "description": "ISO-8601 UTC." },
+        "defect_surfaced": { "type": ["boolean", "null"], "description": "Did a defect attributable to this unit surface post-merge. Recorded affirmatively as false by the horizon sweep (spec §1.3 step 3)." },
+        "linked_incident_id": { "type": ["string", "null"], "description": "Id of the later incident (case-law CL-### / catalog / issue)." },
+        "escape_stage": {
+          "oneOf": [ { "$ref": "#/$defs/stage" }, { "type": "null" } ],
+          "description": "Which stage should have caught it."
+        },
+        "hold_substantiated": { "type": ["boolean", "null"], "description": "For hold/fail rows: did the block prove real." },
+        "outcome_backfilled_at": { "type": "string", "description": "ISO-8601 UTC, when this amendment was written." },
+        "outcome_kind_note": { "type": ["string", "null"] }
+      },
+      "required": [
+        "row_kind", "ledger_id", "schema_version", "outcome_kind",
+        "outcome_ref_ledger_id", "outcome_backfilled_at"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

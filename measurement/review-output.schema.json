@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://framework.local/measurement/review-output.schema.json",
+  "title": "Review Agent Structured Output (gate verdict)",
+  "description": "The structured object a review/verify agent (or a deterministic gate serializer) is FORCED to emit at gate time (spec §2 'capture must be a byproduct, never a step'). A decision ledger row is a direct projection of this object: `ledger.py project` reads a document validating against THIS schema, adds the context fields the reviewer can't know (unit_id, stage, lane, ledger_id, schema_version, round, timestamp) from flags, derives the findings roll-up from the findings array, and emits a row validating against ledger.schema.json. Every decision-time ledger field maps 1:1 onto a field here (or is a pure function of one), so capture never re-types anything.\n\nPROJECTION MAP (review-output field -> ledger field):\n  verdict            -> verdict\n  verdict_reason     -> verdict_reason\n  findings[]         -> finding_ids (each .id), findings_count (len), findings_by_severity (histogram of .severity)\n  evidence_claimed   -> evidence_claimed\n  evidence_verified  -> evidence_verified\n  reviewer_role      -> reviewer_role\n  reviewer_model     -> reviewer_model\n  reviewer_effort    -> reviewer_effort\n  cost_tokens_in     -> cost_tokens_in\n  cost_tokens_out    -> cost_tokens_out\n  cost_usd           -> cost_usd\n  wall_clock_seconds -> wall_clock_seconds\n  gate_results       -> (not projected onto a scalar ledger field; informs evidence_verified and verdict; retained for audit)\n  merge_recommendation -> (advisory; feeds the merge-stage decision, not a decision-row field)\nContext fields supplied by the capture adapter / project flags (NOT emitted by the reviewer):\n  ledger_id, schema_version, unit_id, unit_kind, lane, stage, round, timestamp.",
+  "type": "object",
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "pass-with-required-changes", "fail", "hold"]
+    },
+    "verdict_reason": { "type": ["string", "null"] },
+    "reviewer_role": { "type": "string" },
+    "reviewer_model": { "type": ["string", "null"] },
+    "reviewer_effort": { "type": "string", "enum": ["low", "medium", "high", "max", "deterministic"] },
+    "evidence_claimed": { "type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"] },
+    "evidence_verified": {
+      "type": ["string", "null"],
+      "enum": ["L0", "L1", "L2", "L3", "L4", null],
+      "description": "Null if this stage did not independently re-verify the claim."
+    },
+    "findings": {
+      "type": "array",
+      "description": "One entry per finding. The ledger roll-up (finding_ids / findings_count / findings_by_severity) is derived from this array — the reviewer never hand-counts.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Stable per-finding id." },
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor", "nit"] },
+          "summary": { "type": "string" },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 0 }
+        },
+        "required": ["id", "severity", "summary"],
+        "additionalProperties": false
+      }
+    },
+    "gate_results": {
+      "type": "array",
+      "description": "Per-check results for deterministic/automated gates run as part of this review (compile, tests, lints, schema conformance).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "detail": { "type": ["string", "null"] }
+        },
+        "required": ["name", "passed"],
+        "additionalProperties": false
+      }
+    },
+    "merge_recommendation": {
+      "type": "string",
+      "enum": ["merge", "merge-after-required-changes", "do-not-merge", "hold"]
+    },
+    "cost_tokens_in": { "type": ["integer", "null"], "minimum": 0 },
+    "cost_tokens_out": { "type": ["integer", "null"], "minimum": 0 },
+    "cost_usd": { "type": ["number", "null"], "minimum": 0 },
+    "wall_clock_seconds": { "type": ["number", "null"], "minimum": 0 }
+  },
+  "required": ["verdict", "reviewer_role", "reviewer_effort", "evidence_claimed", "findings", "merge_recommendation"],
+  "additionalProperties": false
+}
