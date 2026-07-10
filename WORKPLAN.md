@@ -221,10 +221,24 @@ the first thing merged so H4 lands under it. Wave C (H6, H7, H8) is independent 
 except H6(b), which is ballot-gated by design. The active-work cap applies as always: this plan
 is a queue, not a burst authorization.
 
-## Open ballots for the human lead
+## Ballots — RULED 2026-07-10
 
-1. **H1 amendment text** — ratify the calibration-boundary law (recommended: as drafted above).
-2. **R1–R6 rulings** — six picks, recommendations marked.
-3. **H6 posture** — publish a pilot evidence packet (which case?), or epistemology note only.
-4. **H5 defaults** — bless the Lite profile's default laws (merge floor L2, verifier always
-   independent, destructive-op floor absolute) as the framework's named defaults.
+All four ballots were put to the human lead and ratified in one pass. His words, verbatim:
+*"open ballots, read them, go with your recommended approach on each. Launch a dynamic
+workflow, assigned out to opus 4.8 max sub agents to execute the workplan, reporting back to
+you for review and verification. Follow our own showrunner goals here, proceed"*
+(2026-07-10, review-feedback session). Recorded here before execution, per the
+ratification-recording rule. The rulings:
+
+1. **H1 amendment text** — RULED: adopt as drafted in H1 above.
+2. **R1–R6** — RULED: the marked recommendation on each of the six.
+3. **H6 posture** — RULED: the epistemology note ships; one pilot packet (CL-009),
+   hygiene-gated; the packet lands on the working branch only if its hygiene gate passes, and
+   the merge/publish decision remains the human's at PR time.
+4. **H5 defaults** — RULED: blessed as drafted (merge floor L2, verifier always independent,
+   destructive-op floor absolute).
+
+**Execution note.** Units are authored by opus-tier max-effort worker sessions under this
+plan, each unit adversarially verified by an independent session (bounded rework, cap 2, then
+ship-flagged), with final verification, gates, and the commit performed by the director
+session. Workers write to the tree and never commit (CL-006).
