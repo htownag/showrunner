@@ -15,7 +15,14 @@ Three-stage adoption path (spec §5), which this tool is built to serve:
   Stage 1 — dashboards at boot. `report` computes catch rate, false-hold rate,
     cost per merged unit, repeat-incident rate, time-to-merge, and evidence
     inflation from the ledger. The boot ritual surfaces them; a human acts by
-    judgment. No automated weight changes a verdict.
+    judgment. No automated weight changes a verdict. Metric behavior follows the
+    ratified rulings R1-R6 (spec §2, §3.1, §3.3): catch rate counts unique
+    (unit_id, stage) pairs that blocked a unit with a major/blocker finding AND
+    resolved hold_substantiated=true; pairs still null on hold_substantiated are
+    PENDING (excluded from the rate, reported per stage); the escaped side dedupes
+    by (unit_id, escape_stage); malformed lines are quarantined loud and metrics
+    refuse to render past a 10% malformed floor; and cost/wall-clock lines print
+    "not captured" rather than a misleading zero when no row carries the field.
 
   Stage 2 — calibration live. `report` also emits per-role calibration weights
     (correlation of self-assessment vs verified outcome, >=20-sample floor,
@@ -154,18 +161,37 @@ def validate(value, schema, root, path="$"):
 # --------------------------------------------------------------------------- #
 
 def _read_rows(ledger_path):
-    """Yield (lineno, row_dict). Raises on JSON error (loud)."""
+    """Read a ledger file, separating parseable rows from malformed lines.
+
+    Returns (rows, malformed):
+      rows      -- list of (lineno, row_dict) for every line that parsed as JSON.
+      malformed -- list of (lineno, error_message) for every non-empty line that
+                   did NOT parse as JSON.
+
+    Blank lines are ignored entirely; a missing file yields ([], []). This
+    function NEVER raises on a bad JSON line (ruling R1): malformed input is
+    surfaced as data so each caller applies its own fail-closed policy. `check`
+    treats any malformed line as a hard failure and exits 1 (it is a compiled
+    gate); `report` quarantines each malformed line loudly, counts it in the
+    dashboard header, and refuses to render metrics once malformed lines exceed
+    10% of the non-empty lines. Silent skipping is never permitted on a
+    measurement surface — a silently dropped line corrupts every denominator
+    invisibly (spec §2, the fail-open sin Principle 5 exists to prevent)."""
     rows = []
+    malformed = []
     try:
         with open(ledger_path) as fh:
             for i, line in enumerate(fh, 1):
                 line = line.strip()
                 if not line:
                     continue
-                rows.append((i, json.loads(line)))
+                try:
+                    rows.append((i, json.loads(line)))
+                except json.JSONDecodeError as exc:
+                    malformed.append((i, str(exc)))
     except FileNotFoundError:
-        return []
-    return rows
+        return [], []
+    return rows, malformed
 
 
 def _row_kind(row):
@@ -229,11 +255,17 @@ def cmd_append(args):
 
 def cmd_check(args):
     schema = _load_schema(args.schema)
-    rows = _read_rows(args.ledger)
-    if not rows:
+    rows, malformed = _read_rows(args.ledger)
+    if not rows and not malformed:
         print("check: %s is empty or absent — nothing to validate." % args.ledger)
         return 0
     bad = 0
+    # Ruling R1: `check` is a compiled gate — any malformed line is fatal, and
+    # every bad line number is named (never silently skipped).
+    for lineno, msg in sorted(malformed):
+        print("check: line %d: malformed JSON (not parseable): %s" % (lineno, msg),
+              file=sys.stderr)
+        bad += 1
     ids = set()
     for lineno, row in rows:
         errors = validate(row, schema, schema)
@@ -255,7 +287,8 @@ def cmd_check(args):
                       % (lineno, ref), file=sys.stderr)
                 bad += 1
     if bad:
-        print("check: FAILED — %d problem(s) across %d rows." % (bad, len(rows)), file=sys.stderr)
+        print("check: FAILED — %d problem(s) across %d parsed row(s) + %d malformed line(s)."
+              % (bad, len(rows), len(malformed)), file=sys.stderr)
         return 1
     print("check: OK — %d rows valid, no duplicate ids, all amendments resolve." % len(rows))
     return 0
@@ -313,6 +346,16 @@ def cmd_project(args):
         "cost_usd": args.cost_usd if args.cost_usd is not None else ro.get("cost_usd"),
         "wall_clock_seconds": args.wall_clock_seconds if args.wall_clock_seconds is not None else ro.get("wall_clock_seconds"),
     }
+    # Ruling R5 passthrough: the project's own stage / unit-kind label rides
+    # through from a flag or from the review-output object ("map to canonical,
+    # preserve raw", spec §1.1). Emitted only when present so v1 projections stay
+    # unchanged; the schema (v2) accepts either field as optional.
+    stage_raw = args.stage_raw if args.stage_raw is not None else ro.get("stage_raw")
+    unit_kind_raw = args.unit_kind_raw if args.unit_kind_raw is not None else ro.get("unit_kind_raw")
+    if stage_raw is not None:
+        row["stage_raw"] = stage_raw
+    if unit_kind_raw is not None:
+        row["unit_kind_raw"] = unit_kind_raw
     # Validate the projected row before emitting (fail loud, don't emit garbage).
     led_schema = _load_schema(args.schema)
     perr = validate(row, led_schema, led_schema)
@@ -374,24 +417,124 @@ def _weight_from_r(r):
     return round(min(0.20 * r, 0.20), 2)
 
 
+BLOCKED_VERDICTS = ("fail", "hold")
+COST_FIELDS = ("cost_tokens_in", "cost_tokens_out", "cost_usd")
+
+
+def _catch_metrics(decisions):
+    """Per-stage catch/escaped/pending counts over folded decision rows.
+
+    Implements rulings R2/R3/R4 (spec §3.1). Returns
+    {stage: {"caught": int, "escaped": int, "pending": int}}:
+
+      caught  — unique (unit_id, stage) pairs that BLOCKED the unit (a `fail` or
+                `hold` verdict) carrying a major/blocker finding AND resolved
+                hold_substantiated=true. A blocked unit never merges, so
+                defect_surfaced is unobservable for exactly these rows;
+                hold_substantiated is the observable outcome-consistency signal.
+      pending — the same blocked+major pairs whose hold_substantiated is still
+                null: excluded from the rate entirely (never a catch, never a
+                miss), reported separately per stage (R3). hold_substantiated
+                false is NOT counted here — it is not a catch, and feeds the
+                (unchanged) false-hold metric.
+      escaped — unique (unit_id, escape_stage) pairs among merged units with
+                defect_surfaced=true (R4 dedup on the escaped side).
+
+    Both sides count units, not decision rows, so a rework round that repeats a
+    finding is one pair, never double-counted."""
+    caught_pairs = set()
+    pending_pairs = set()
+    for d in decisions:
+        sev = d.get("findings_by_severity", {}) or {}
+        raised_major = (sev.get("blocker", 0) + sev.get("major", 0)) > 0
+        if raised_major and d.get("verdict") in BLOCKED_VERDICTS:
+            pair = (d.get("unit_id"), d.get("stage"))
+            hs = d.get("hold_substantiated")
+            if hs is True:
+                caught_pairs.add(pair)
+            elif hs is None:
+                pending_pairs.add(pair)
+            # hs is False -> not a catch; feeds false-hold, not counted here.
+    # A (unit, stage) resolved as caught in any round overrides a pending pair
+    # for the same key (the outcome resolved).
+    pending_pairs.difference_update(caught_pairs)
+
+    escaped_pairs = set()
+    for d in decisions:
+        if d.get("defect_surfaced") is True and d.get("escape_stage"):
+            escaped_pairs.add((d.get("unit_id"), d.get("escape_stage")))
+
+    stages = {s for _, s in caught_pairs} | {s for _, s in escaped_pairs} \
+        | {s for _, s in pending_pairs}
+    metrics = {}
+    for s in stages:
+        metrics[s] = {
+            "caught": sum(1 for _, st in caught_pairs if st == s),
+            "escaped": sum(1 for _, st in escaped_pairs if st == s),
+            "pending": sum(1 for _, st in pending_pairs if st == s),
+        }
+    return metrics
+
+
+def _stage_raw_map(decisions):
+    """canonical stage -> sorted list of distinct non-null stage_raw labels seen
+    (ruling R5). Used to annotate per-stage report lines only where a project
+    recorded its own raw stage label."""
+    raw = defaultdict(set)
+    for d in decisions:
+        sr = d.get("stage_raw")
+        if sr:
+            raw[d.get("stage")].add(sr)
+    return {s: sorted(v) for s, v in raw.items()}
+
+
+def _stage_label(stage, raw_map):
+    """Render a stage with a `(raw: X, Y)` aggregation note where raw labels
+    exist for it, else the bare canonical stage (ruling R5)."""
+    raws = raw_map.get(stage)
+    if raws:
+        return "%s (raw: %s)" % (stage, ", ".join(raws))
+    return stage
+
+
 # --------------------------------------------------------------------------- #
 # Subcommand: report                                                         #
 # --------------------------------------------------------------------------- #
 
 def cmd_report(args):
-    rows = _read_rows(args.ledger)
+    rows, malformed = _read_rows(args.ledger)
     out = []
     W = out.append
     W("=" * 68)
     W("REVIEW LEDGER DASHBOARD  (source: %s)" % args.ledger)
     W("=" * 68)
-    if not rows:
+    total_nonempty = len(rows) + len(malformed)
+    if total_nonempty == 0:
         W("Ledger is empty or absent. Nothing to report yet.")
         W("Stage-0 capture has produced no rows — wire the append adapter first")
         W("(see boot-integration.md). All metrics below become available once")
         W("decision rows and back-filled outcome rows exist.")
         print("\n".join(out))
         return 0
+
+    # Ruling R1: quarantine malformed lines LOUD in the header, and refuse to
+    # render metrics past a 10% malformed floor (a corrupt denominator is worse
+    # than no dashboard). `report` skips the bad line but never silently.
+    if malformed:
+        frac = len(malformed) / total_nonempty
+        W("!! QUARANTINE: %d malformed line(s) skipped, of %d non-empty line(s)."
+          % (len(malformed), total_nonempty))
+        W("   malformed line number(s): %s"
+          % ", ".join(str(ln) for ln, _ in sorted(malformed)))
+        W("   malformed fraction = %.1f%% (refusal threshold: >10%%)." % (100.0 * frac))
+        if frac > 0.10:
+            W("   REFUSING to render metrics: more than 10% of non-empty lines are")
+            W("   malformed, so every denominator below would be untrustworthy")
+            W("   (ruling R1). Fix the ledger and re-run; `check` names each bad line.")
+            W("=" * 68)
+            print("\n".join(out))
+            return 1
+        W("")
 
     enriched = _fold(rows)
     decisions = list(enriched.values())
@@ -412,24 +555,28 @@ def cmd_report(args):
 
     # ---- 3.1 catch rate (per stage) --------------------------------------- #
     W("-- Reviewer catch rate (per stage) " + "-" * 33)
-    W("   caught = stage raised blocker/major AND blocked (fail/hold);")
-    W("   escaped = merged unit with defect_surfaced and escape_stage==S.")
-    caught = defaultdict(int)
-    escaped = defaultdict(int)
-    for d in decisions:
-        sev = d.get("findings_by_severity", {})
-        raised_major = (sev.get("blocker", 0) + sev.get("major", 0)) > 0
-        if raised_major and d.get("verdict") in ("fail", "hold"):
-            caught[d["stage"]] += 1
-    for d in decisions:
-        if d.get("defect_surfaced") is True and d.get("escape_stage"):
-            escaped[d["escape_stage"]] += 1
-    stages = sorted(set(caught) | set(escaped))
-    if not stages:
-        W("   n/a — no caught defects and no attributed escapes yet.")
-    for s in stages:
-        c, e = caught[s], escaped[s]
-        W("   %-16s catch_rate = %s" % (s, _pct(c, c + e)))
+    W("   caught = unique (unit_id, stage) blocked (fail/hold) with a major/")
+    W("   blocker finding AND hold_substantiated=true (rulings R2/R3/R4);")
+    W("   pending = same but hold_substantiated null — excluded from the rate;")
+    W("   escaped = merged unit, defect_surfaced, escape_stage==S, deduped by")
+    W("   (unit_id, escape_stage).")
+    catch = _catch_metrics(decisions)
+    raw_map = _stage_raw_map(decisions)
+    if not catch:
+        W("   n/a — no caught defects, pending blocks, or attributed escapes yet.")
+    for s in sorted(catch):
+        c = catch[s]["caught"]
+        e = catch[s]["escaped"]
+        p = catch[s]["pending"]
+        label = _stage_label(s, raw_map)
+        if c + e == 0:
+            W("   %-16s catch_rate = n/a (0 resolved samples)" % label)
+        else:
+            W("   %-16s catch_rate = %s" % (label, _pct(c, c + e)))
+        if p:
+            W("   %-16s   pending (excluded from rate): %d unit(s) awaiting"
+              % ("", p))
+            W("   %-16s   hold_substantiated back-fill (ruling R3)." % "")
     W("")
 
     # ---- 3.2 false-hold rate (per stage) ---------------------------------- #
@@ -444,7 +591,7 @@ def cmd_report(args):
     if not holds:
         W("   n/a — no hold/fail rows yet.")
     for s in sorted(holds):
-        W("   %-16s false_hold = %s" % (s, _pct(false_holds[s], holds[s])))
+        W("   %-16s false_hold = %s" % (_stage_label(s, raw_map), _pct(false_holds[s], holds[s])))
     W("")
 
     # ---- 3.3 cost per merged unit ----------------------------------------- #
@@ -453,18 +600,32 @@ def cmd_report(args):
     if not merged_units:
         W("   n/a — no merged units recorded yet.")
     else:
-        usd_rows = [d for d in decisions if d["unit_id"] in merged_units and d.get("cost_usd") is not None]
-        tok_rows = [d for d in decisions if d["unit_id"] in merged_units]
-        total_usd = sum(d["cost_usd"] for d in usd_rows)
-        total_tok = sum((d.get("cost_tokens_in") or 0) + (d.get("cost_tokens_out") or 0) for d in tok_rows)
+        merged_rows = [d for d in decisions if d["unit_id"] in merged_units]
         nmerged = len(merged_units)
         W("   merged units: %d" % nmerged)
-        if usd_rows:
-            W("   cost_usd / merged unit   = $%.4f  (over %d priced rows)" % (total_usd / nmerged, len(usd_rows)))
-        W("   tokens   / merged unit   = %d" % (total_tok // nmerged))
-        wc = [d.get("wall_clock_seconds") for d in tok_rows if d.get("wall_clock_seconds") is not None]
-        if wc:
-            W("   wall-clock / merged unit = %.0fs" % (sum(wc) / nmerged))
+        # Ruling R6: when NO decision row for merged units carries a cost field,
+        # print a not-captured line rather than computing a zero that reads as a
+        # measurement of a cheap pipeline (Principle 5). Graduates the moment a
+        # row first carries cost data.
+        cost_rows = [d for d in merged_rows
+                     if any(d.get(f) is not None for f in COST_FIELDS)]
+        if not cost_rows:
+            W("   cost: not captured (no rows carry cost fields)")
+        else:
+            usd_rows = [d for d in cost_rows if d.get("cost_usd") is not None]
+            total_tok = sum((d.get("cost_tokens_in") or 0) + (d.get("cost_tokens_out") or 0)
+                            for d in cost_rows)
+            if usd_rows:
+                total_usd = sum(d["cost_usd"] for d in usd_rows)
+                W("   cost_usd / merged unit   = $%.4f  (over %d priced rows)"
+                  % (total_usd / nmerged, len(usd_rows)))
+            W("   tokens   / merged unit   = %d" % (total_tok // nmerged))
+        wc_rows = [d for d in merged_rows if d.get("wall_clock_seconds") is not None]
+        if not wc_rows:
+            W("   wall-clock: not captured (no rows carry wall_clock_seconds)")
+        else:
+            W("   wall-clock / merged unit = %.0fs"
+              % (sum(d["wall_clock_seconds"] for d in wc_rows) / nmerged))
     W("")
 
     # ---- 3.4 repeat-incident rate (join to failure catalog / CL-IDs) ------ #
@@ -517,7 +678,13 @@ def cmd_report(args):
         med, p90 = _median(ttm), _percentile(ttm, 90)
         W("   median = %s   p90 = %s   (n=%d merged units)"
           % (_fmt_dur(med), _fmt_dur(p90), len(ttm)))
-        if active_frac:
+        # Ruling R6: the active/waiting split needs wall_clock_seconds; when no
+        # row carries it, say so rather than implying an active fraction.
+        any_wc = any(d.get("wall_clock_seconds") is not None
+                     for d in decisions if d["unit_id"] in merged_units)
+        if not any_wc:
+            W("   active-review fraction: not captured (no rows carry wall_clock_seconds)")
+        elif active_frac:
             af = sum(active_frac) / len(active_frac)
             W("   mean active-review fraction = %.0f%% (rest is waiting — often on"
               % (100 * af))
@@ -635,10 +802,16 @@ def build_parser():
     pr.add_argument("--unit-id", required=True)
     pr.add_argument("--unit-kind", required=True,
                     choices=["code", "spec", "asset", "doc", "pack", "config"])
+    pr.add_argument("--unit-kind-raw", default=None,
+                    help="ruling R5: project's own unit-kind label, preserved verbatim "
+                         "when the canonical map is lossy (also read from review-output)")
     pr.add_argument("--lane", required=True)
     pr.add_argument("--stage", required=True,
                     choices=["subagent-self", "lead-review", "design-advisor",
                              "code-advisor", "automated-gate", "merge", "human-final"])
+    pr.add_argument("--stage-raw", default=None,
+                    help="ruling R5: project's own stage label, preserved verbatim "
+                         "when the canonical map is lossy (also read from review-output)")
     pr.add_argument("--round", type=int, default=0)
     pr.add_argument("--reviewer-role", default=None)
     pr.add_argument("--reviewer-model", default=None)

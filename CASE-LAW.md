@@ -9,7 +9,8 @@ checklist step, and graduates (when it can) into a lint/hook/test that no longer
 anyone remembering. The enforcement column records how far each rule has climbed that ladder.*
 
 **Proving grounds** (neutral labels): *studio project* · *validation project* ·
-*production pipeline* · *client app* · *orchestration platform*. The alias→repository legend
+*production pipeline* · *client app* · *orchestration platform* · *framework repo* (this
+repository itself, a sixth ground added with CL-043). The alias→repository legend
 for the citations is held privately in the origin and is deliberately not part of this repo —
 the aliases point into private repositories by design, so they stay opaque here.
 
@@ -455,6 +456,27 @@ Source: `studio:docs/kb/director-handbook.md:97`
 
 ---
 
-*42 entries. The catalog is living: any new earned incident is promoted into it the same session
+## The framework governs itself (an external review of the framework repo)
+
+**CL-043 · 2026-07-10 · framework repo · prose rule → compiled gate**
+The proving ground here is a sixth, plainly stated: this framework repository itself, alongside the
+five above. An external adversarial full-repo review — an independent frontier model reading the
+whole tree — caught a constitutional conflict that the framework's own internal reviews had passed:
+the calibration spec (`measurement/review-ledger-spec.md` §4) permitted a trusted, high-correlation
+role's *solo pass* to clear a unit without the adversarial re-read that the review pipeline
+(`mechanisms/review-pipeline.md`) and Principle 6 define as framework law — the framework violating
+its own load-bearing rule. The same review caught the measurement implementation diverging from its
+spec (counting decision rows instead of units, with no outcome-consistency check on catches) with
+nothing compiled to catch the drift — a spec enforced by prose alone.
+**Rule:** Calibration tunes the *intensity* of the independent verifier (effort, tier, model,
+context breadth, sampling depth) and never removes it — the author/gate role boundary outranks any
+measured self-score correlation. And a spec whose implementation carries no conformance fixtures is
+prose, not law: measurement specs graduate to compiled gates like every other rule, via a golden-
+fixture conformance suite (the H3 suite) run in CI. Enforcement climbs prose rule → compiled gate.
+Source: `external:showrunner-review-2026-07-10`, `WORKPLAN.md` (Adjudications; H1; H3)
+
+---
+
+*43 entries. The catalog is living: any new earned incident is promoted into it the same session
 it happens, and rows that graduate into an enforced lint/hook/test archive out of the prose layer.
 A catalog frozen at its codification date decays into history.*
