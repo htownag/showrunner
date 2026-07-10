@@ -62,8 +62,10 @@ by the back-fill protocol (§1.3). Append-only integrity is preserved by writing
 | `schema_version` | int | ≥ 1 | capture adapter | at decision |
 | `unit_id` | string | PR number / branch / task id | from review context | at decision |
 | `unit_kind` | enum | `code` `spec` `asset` `doc` `pack` `config` | from review context | at decision |
+| `unit_kind_raw` | string \| null | the project's own unit-kind label, verbatim, when the canonical map was lossy (optional; `schema_version` 2) | from review context | at decision |
 | `lane` | string | project's lane/team label (neutral role, not a codename) | from review context | at decision |
 | `stage` | enum | `subagent-self` `lead-review` `design-advisor` `code-advisor` `automated-gate` `merge` `human-final` | capture adapter | at decision |
+| `stage_raw` | string \| null | the project's own stage label, verbatim, when the canonical map was lossy (optional; `schema_version` 2) | capture adapter | at decision |
 | `round` | int | 0 = first pass, 1+ = rework round | capture adapter | at decision |
 | `reviewer_role` | string | neutral role label (`lead`, `advisor`, `director`, submitting subagent role) | capture adapter | at decision |
 | `reviewer_model` | string \| null | model/tier label; null for deterministic gates | capture adapter | at decision |
@@ -81,6 +83,7 @@ by the back-fill protocol (§1.3). Append-only integrity is preserved by writing
 | `cost_usd` | float \| null | ≥ 0 | capture adapter | at decision |
 | `wall_clock_seconds` | float \| null | active review duration for this stage | capture adapter | at decision |
 | `outcome_kind` | enum | `outcome` (marks an amendment row) | back-fill ritual | later |
+| `outcome_kind_note` | string \| null | free note on an amendment row (already present in `ledger.schema.json`; ratified into the spec here) | back-fill ritual | later |
 | `outcome_ref_ledger_id` | string | the `ledger_id` this outcome amends | back-fill ritual | later |
 | `merged` | bool \| null | did the unit merge | back-fill ritual / merge stage | at merge |
 | `merge_timestamp` | string \| null | ISO-8601 UTC | merge stage | at merge |
@@ -90,12 +93,29 @@ by the back-fill protocol (§1.3). Append-only integrity is preserved by writing
 | `hold_substantiated` | bool \| null | for `hold`/`fail` rows: did the block prove real | back-fill ritual | later |
 | `outcome_backfilled_at` | string \| null | ISO-8601 UTC | back-fill ritual | later |
 
+**Raw-label preservation (ruling R5, `schema_version` 2).** The canonical `stage` and `unit_kind`
+enums stay fixed — cross-project comparability is the whole point of a canonical vocabulary — but the
+first real deployment needed project-specific stage and unit-kind names on day one (stages
+`adversarial-sweep` and `director-verification`, unit_kind `framework-deliverable`) and lossy-mapped
+them into the canonical enum with the mapping buried as prose inside `verdict_reason`, invisible to
+every non-human reader. So `stage_raw`, `unit_kind_raw`, and `outcome_kind_note` are ratified into
+the spec (the last already present in `ledger.schema.json`). The capture rule is **map to canonical,
+preserve raw**: always set the canonical enum, and when that mapping is lossy, record the project's
+own label verbatim in the matching `_raw` field. These fields ship in `schema_version: 2`; they are
+optional, so `v1` rows remain valid unchanged.
+
 ### 1.2 Notes on the load-bearing fields
 
 - **`verdict`** separates `fail` (substantive reject — a real defect) from `hold` (blocked pending
   external input or an unverifiable claim — no substantive defect asserted). The distinction is not
-  cosmetic: `hold` feeds the false-hold metric, `fail` feeds catch rate. The studio has a real
-  false-hold on record — two *sound* PRs held on an unrecorded ruling stamp
+  cosmetic, but the original routing was wrong and the first real ledger data proved it (per ruling
+  R2): a `hold` row counts toward **catch rate** only when it later resolves `hold_substantiated=true`,
+  and both `hold` and `fail` rows feed **false-hold** (a `hold`/`fail` that resolves
+  `hold_substantiated=false` is the over-block the false-hold metric exists to catch). The earlier
+  "`hold` feeds the false-hold metric, `fail` feeds catch rate" routing was falsified on contact with
+  real data — the first ledger carried two substantiated holds (`hold_substantiated=true`) that were
+  *genuine catches* of law-surface defects, not false blocks. The studio also has a real false-hold
+  on record — two *sound* PRs held on an unrecorded ruling stamp
   (`studio:docs/kb/director-handbook.md` §6, the phantom-ruling row) — which is exactly a `hold`
   that later resolved `hold_substantiated=false`.
 - **`evidence_claimed` vs `evidence_verified`** are both done-ladder levels. Evidence inflation is
@@ -140,8 +160,15 @@ alternatives:
 - **vs CSV** — the row has nested fields (`findings_by_severity`, `finding_ids[]`); CSV forces a
   lossy flatten-and-escape. Rejected.
 - **vs YAML** — a single malformed row breaks parsing of the *whole document*; append means
-  hand/agent-written edits, so malformed rows are a when-not-if. JSONL degrades gracefully — one
-  bad line is skipped, the rest still parse. Rejected.
+  hand/agent-written edits, so malformed rows are a when-not-if. JSONL is *format-resilient* — a
+  malformed line is structurally isolated, so the surrounding lines still parse. But that resilience
+  is format-level only and is **never** a license for silence: on a *measurement* surface a silently
+  skipped line corrupts every denominator invisibly, the exact fail-open sin Principle 5 exists to
+  prevent. So the rule (per ruling R1) is fail-closed on malformed input — `check` fails loud on any
+  malformed line (it is a compiled gate), and `report` quarantines each malformed line, prints a loud
+  per-line quarantine count in the dashboard header, and **refuses to render metrics if more than 10%
+  of lines are malformed**. "Graceful degradation" survives only as this format-resilience, never as
+  a skipped-and-forgotten line. Rejected as a silence rationale; kept as a resilience one.
 - **JSONL wins** on three counts that matter to this framework specifically: (a) **append is a pure
   line-add**, so two concurrent sessions never conflict on existing rows and the git diff is
   additions-only — this fits trunk-based development and "state lives in the repo"; (b) nested
@@ -182,10 +209,24 @@ a metric. The framework's rule is applied ruthlessly — cut metrics are named i
 
 ### 3.1 Reviewer catch rate (per stage / per reviewer role)
 
-- **Definition.** `catch_rate(S) = caught(S) / (caught(S) + escaped(S))`, where `caught(S)` = count
-  of units where stage S raised a `major`/`blocker` finding on a real defect (later
-  `defect_surfaced`-consistent), and `escaped(S)` = count of merged units with `defect_surfaced=true`
-  and `escape_stage == S`. Computed over a window, per `stage` and per `reviewer_role`.
+- **Definition.** `catch_rate(S) = caught(S) / (caught(S) + escaped(S))`, computed over a window, per
+  `stage` and per `reviewer_role`. Per rulings R2/R3/R4:
+  - `caught(S)` = count of **unique `(unit_id, stage)` pairs** where stage S *blocked* the unit
+    (a `fail` or `hold` verdict) carrying a `major`/`blocker` finding **and** `hold_substantiated=true`.
+    A blocked unit never merges, so `defect_surfaced` is *unobservable* for exactly the caught rows —
+    the defect was stopped before it could surface post-merge. `hold_substantiated` is therefore the
+    observable outcome-consistency signal for a catch, and it replaces the earlier (epistemically
+    broken) "later `defect_surfaced`-consistent" wording, which demanded an observation that can never
+    exist for a caught row.
+  - `escaped(S)` = count of **unique `(unit_id, escape_stage)` pairs** among merged units with
+    `defect_surfaced=true` and `escape_stage == S`.
+  - **Unit-level dedup (R4).** Both sides count *units*, not decision rows — a rework round that
+    repeats the same finding is one `(unit_id, stage)` pair on the caught side and one
+    `(unit_id, escape_stage)` pair on the escaped side, never double-counted.
+  - **Pending rows (R3).** A row blocked with a `major`/`blocker` finding whose `hold_substantiated`
+    is still null is **pending** — reported as a separate per-stage count, and excluded from the rate
+    entirely: never a catch, never a miss. It enters the numerator or the denominator only once its
+    outcome resolves.
 - **Decision.** Where to spend the strongest model/effort configuration, and which stage to cut.
   Operationalizes "verification outranks generation, gets the strongest configuration" and "spend
   the highest-effort configuration on VERIFY stages" (`studio:docs/kb/director-handbook.md` §5) with
@@ -222,6 +263,14 @@ a metric. The framework's rule is applied ruthlessly — cut metrics are named i
 - **Decision.** Is the review apparatus affordable per unit of throughput, and which stage dominates
   cost (→ move that stage to a cheaper model or a deterministic gate). Directly informs the runner-
   cycle economics behind PR batching (`studio:docs/kb/director-handbook.md` §7).
+- **Capture status (ruling R6).** This metric is honestly **not yet capturable**: no real ledger row
+  carries `cost_tokens_*`, `cost_usd`, or `wall_clock_seconds`, because no capture hook yet pulls them
+  from the session harness at verdict-recording time. Until such a hook exists, the dashboard
+  **suppresses** every cost line rather than rendering `tokens/merged unit = 0` — a zero here is not a
+  measurement of a cheap pipeline, it is the *absence* of measurement, and rendering it as a number
+  reads as the former (Principle 5: never let a fail-open default masquerade as a real reading). The
+  metric graduates from suppressed to live the moment a row first carries cost data; the preferred
+  fix is the harness hook, the interim rule is suppression.
 - **Failure mode as a metric.** (a) Cost-per-*merged* unit ignores spend on units that failed or
   were abandoned — a pipeline can look cheap per merge while burning budget on rejects; pair with
   cost-per-attempt. (b) Cheapness is not the goal — driving it down by cutting verification raises
@@ -325,21 +374,40 @@ the role's self-assessment and the verified outcome:
 
 **The feedback (what the weight changes).** The weight `w` derived from the correlation (same
 mapping shape as the platform: strong positive r → small positive w; noise or inverted r → 0) tunes
-**verification intensity**, not the merge bar:
+**verification intensity** — not the merge bar, and not the *existence* of the independent verifier:
 
-- High-correlation role → lighter, cheaper verification (e.g. its solo pass may clear a unit without
-  the mandatory adversarial re-read; its `evidence_claimed` may be provisionally accepted).
-- Low / noise / inverted role → full adversarial verification stays mandatory (weight 0.0 — its
-  self-assessment counts for nothing, exactly as the platform zeroes the noise/inverted agents).
+- High-correlation role → the independent adversarial verifier still runs, but *cheaper*: a lower
+  effort tier, a cheaper model, a narrower context slice, or shallower sampling depth. Its
+  `evidence_claimed` may be provisionally accepted pending the deterministic gates — never in place
+  of them, and never in place of the re-read itself.
+- Low / noise / inverted role → the verifier runs at full effort (weight 0.0 — its self-assessment
+  counts for nothing, exactly as the platform zeroes the noise/inverted agents).
 
 This is the platform's `final = (1-w)·external + w·self` blend, applied to *how much scrutiny a
-verdict buys itself out of* rather than to a numeric score.
+verdict buys itself out of* rather than to a numeric score — and the precedent is load-bearing on
+exactly this point. The ported mechanism capped `w` at ~0.2 (`platform:gateway/core/sgs.py:38-46`,
+its highest weight is researcher r=0.747→0.15) and **never once removed the external evaluator from
+the blend**: `(1-w)` never reaches 0, so a self-score buys *down* the weight on external truth, never
+buys *out* of it. The studio port inherits that floor — a trusted self-score cheapens the external
+check, it never replaces it.
 
-**Hard guardrail.** Calibration may only ever *reduce* discretionary re-review for a proven role or
-keep it full — it may **never** let a unit merge below the done-ladder floor (L2 for merge, hard
-rule 2) and never lets a high self-score substitute for a compiled gate (CI, lints). This keeps "an
-LLM is never the last line of defense" intact: calibration tunes the *adversarial re-read* budget,
-never the deterministic gates.
+**Hard guardrail — the calibration boundary.** Per the ratified H1 amendment (recorded as CL-043,
+minted the session an external adversarial review caught this very spec permitting a trusted role's
+*solo pass* to skip the adversarial re-read that the review pipeline
+(`mechanisms/review-pipeline.md`) and Principle 6 define as framework law):
+
+> Calibration may tune the verifier's effort tier, model, context breadth, and sampling depth.
+> It may never remove the independent verifier, collapse author/gate separation, lower the
+> done-ladder merge floor, or substitute a self-score for a compiled gate. The trust ladder
+> bottoms out at "author → deterministic prechecks → cheap independent verifier" — never
+> "author → author's trusted self-score → merge."
+
+So calibration may only ever *cheapen* discretionary re-review for a proven role or keep it full — it
+may **never** let a unit merge below the done-ladder floor (L2 for merge, hard rule 2) and never lets
+a high self-score substitute for a compiled gate (CI, lints). This keeps "an LLM is never the last
+line of defense" (Principle 5) and "verification outranks generation" (Principle 6) intact:
+calibration tunes the *adversarial re-read* budget, never removes the re-read, and never touches the
+deterministic gates.
 
 **Recompute cadence.** At a batching boundary, not per decision (a decision's outcome isn't known
 until back-fill): recompute at the weekly dispatch (`studio:docs/kb/director-handbook.md` §7 weekly
@@ -417,15 +485,17 @@ intensity per §4. The master switch defaults ON; any role below the sample floo
 
 ## Appendix A — Final ledger-row field list (quick reference)
 
-**Identity/context:** `ledger_id`, `schema_version`, `unit_id`, `unit_kind`, `lane`, `stage`,
-`round`, `reviewer_role`, `reviewer_model`, `reviewer_effort`, `timestamp`.
+**Identity/context:** `ledger_id`, `schema_version`, `unit_id`, `unit_kind`, `unit_kind_raw`, `lane`,
+`stage`, `stage_raw`, `round`, `reviewer_role`, `reviewer_model`, `reviewer_effort`, `timestamp`.
 **Verdict:** `verdict`, `verdict_reason`.
 **Findings:** `findings_count`, `findings_by_severity`, `finding_ids`.
 **Evidence (done-ladder):** `evidence_claimed`, `evidence_verified`.
 **Cost:** `cost_tokens_in`, `cost_tokens_out`, `cost_usd`, `wall_clock_seconds`.
-**Outcome (back-filled, written as amendment rows):** `outcome_kind`, `outcome_ref_ledger_id`,
-`merged`, `merge_timestamp`, `defect_surfaced`, `linked_incident_id`, `escape_stage`,
-`hold_substantiated`, `outcome_backfilled_at`.
+**Outcome (back-filled, written as amendment rows):** `outcome_kind`, `outcome_kind_note`,
+`outcome_ref_ledger_id`, `merged`, `merge_timestamp`, `defect_surfaced`, `linked_incident_id`,
+`escape_stage`, `hold_substantiated`, `outcome_backfilled_at`.
+(`unit_kind_raw`, `stage_raw`, `outcome_kind_note` are the `schema_version` 2 additions per ruling R5;
+optional, so v1 rows stay valid.)
 
 ## Appendix B — Self-checklist against the workplan extraction tests
 

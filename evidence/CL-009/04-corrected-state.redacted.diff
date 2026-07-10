@@ -1,0 +1,80 @@
+# REDACTED RECONSTRUCTED DIFF — the correction the adversarial findings produced.
+# The fix was applied by the director after verifier B's HOLD and merged inside the work item's
+# single squashed commit; no discrete fix commit survives (PROVENANCE.md). The `+` lines below are
+# the REAL surviving source under substitution; the `-` lines follow the reconstruction rule
+# (the fixed source with the two documented guards inverted). Identifiers neutralized per
+# PROVENANCE.md; hunk headers are prose anchors because real paths/line numbers are withheld.
+
+--- a/App.Persistence/CraftService.cs
++++ b/App.Persistence/CraftService.cs
+@@ CraftAsync, after the empty-input guard @@
+         if (inputLotIds.Count == 0)
+         {
+             throw new ArgumentException("a craft needs at least one input lot", nameof(inputLotIds));
+         }
+
++        // Hard rule 4: a duplicated lot id would double-weight that lot in the quality mean while
++        // consuming it once — reject before touching the database.
++        var distinctLots = new HashSet<Guid>();
++        foreach (Guid id in inputLotIds)
++        {
++            if (!distinctLots.Add(id))
++            {
++                throw new ArgumentException($"duplicate input lot {id} in a single craft", nameof(inputLotIds));
++            }
++        }
++
+         await using var conn = new NpgsqlConnection(_connectionString);
+
+@@ the read+lock query @@
+                 SELECT l.quality, l.quantity, l.tier, t.quality_cap
+                 FROM db.material_lot l
+                 JOIN db.material_tier t ON t.tier = l.tier
+-                WHERE l.lot_id = @id
++                WHERE l.lot_id = @id AND l.owner = @actor
+                 FOR UPDATE OF l;
+                 """, conn, tx);
+             cmd.Parameters.AddWithValue("id", lotId);
++            cmd.Parameters.AddWithValue("actor", actor);
+
+             await using var reader = await cmd.ExecuteReaderAsync(ct);
+             if (!await reader.ReadAsync(ct))
+             {
+-                throw new InvalidOperationException($"input lot {lotId} not found (harvest it before crafting).");
++                // Hard rule 4: ownership is part of the lot's identity at the bench — a crafter can
++                // only consume lots they own; a foreign lot reads as not-found.
++                throw new InvalidOperationException($"input lot {lotId} not found or not owned by the crafter (harvest it before crafting).");
+             }
+
+
+# --- Covering tests added in the same fix (redacted) ---
+# Each hole gets a test that would FAIL if the guard were removed (coverage-adequacy standard).
+
++    [Fact]
++    public async Task Craft_DuplicateInputLots_Throws_LotNotConsumed()
++    {
++        // [ database-reachable probe / seed / harvest one real lot ]
++        // The same lot twice would double-weight its quality in the aggregate while consuming it once.
++        await Assert.ThrowsAsync<ArgumentException>(() =>
++            new CraftService(conn, registry).CraftAsync(
++                ownerId, "test-item", new[] { lot.LotId, lot.LotId }, Plan,
++                craftSeed: /* fixed */, skill: 0.6, facility: 0.4));
++
++        Assert.True(await LotExists(conn, lot.LotId)); // rejected before any consumption
++    }
++
++    [Fact]
++    public async Task Craft_ForeignLot_Throws_LotNotConsumed()
++    {
++        // [ database-reachable probe / seed / harvest one real lot owned by ownerId ]
++        // A crafter may only consume lots they own — a foreign lot reads as not-found.
++        Guid notTheOwner = Guid.NewGuid();
++        await Assert.ThrowsAsync<InvalidOperationException>(() =>
++            new CraftService(conn, registry).CraftAsync(
++                notTheOwner, "test-item", new[] { lot.LotId }, Plan,
++                craftSeed: /* fixed */, skill: 0.6, facility: 0.4));
++
++        Assert.True(await LotExists(conn, lot.LotId)); // the owner's lot is untouched
++    }
+
+# Result: suite 77 -> 79 passing (0 skipped). Both rejections fail closed and leave the lot unconsumed.
